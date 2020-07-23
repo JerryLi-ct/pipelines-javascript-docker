@@ -3,21 +3,29 @@
 # https://docs.microsoft.com/azure/devops/pipelines/languages/docker
 
 trigger:
-- master
+  branches:
+    include:
+    #- develop    # disabling trigger for now; need to switch to schedule trigger
+    - dev-4-k8sagent
+    #- releases/*
+  paths:
+    exclude:
+    - deployment/*
+    - azure-pipelines.yml
 
 resources:
 - repo: self
 
 variables:
   # Container registry service connection established during pipeline creation
-  imageName: 'pipelines-javascript-docker'
+  imageName: 'pipelines-javascript-k8s'
   dockerRegistryServiceConnection: 'docker.io/ezlee'
   imageRepository: 'ezlee/$(imageName)' 
   containerRegistry: 'docker.io/ezlee'
   dockerfilePath: 'app/Dockerfile'
   tag: '$(Build.BuildId)'
 
-  # Agent VM image name
+  # Agent VM image name - Microsoft hosted agent
   vmImageName: 'ubuntu-latest'
 
 stages:
@@ -28,7 +36,40 @@ stages:
     displayName: Build image
     pool:
       vmImage: $(vmImageName)
+      workspace:
+        clean: all
     steps:
+    - task: Bash@3
+      displayName: show workspace and other environment variables
+      inputs:
+        targetType: 'inline'
+        script: 'env | sort'
+    - task: Bash@3
+      displayName: list files
+      inputs:
+        targetType: 'inline'
+        script: 'whoami; pwd ; ls -alh; which docker; docker version; cat $BUILD_SOURCESDIRECTORY/app/server.js'
+    - task: replacetokens@3
+      displayName: Add build number in server.js
+      inputs:
+        rootDirectory: $(Build.sourcesDirectory)/app
+        targetFiles: 'server.js'
+        keepToken: true
+        tokenPrefix: __
+        tokenSuffix: __
+    - task: Bash@3
+      displayName: show server.js file
+      inputs:
+        targetType: 'inline'
+        script: 'cat $BUILD_SOURCESDIRECTORY/app/server.js' 
+    - task: SonarCloudPrepare@1
+      displayName: Sonarcloud Prepare
+      inputs:
+        SonarCloud: 'SonarCloud'
+        organization: 'ezlee'
+        projectKey: 'ezlee_pipelines-javascript-docker'
+        projectName: 'pipeline-javascript-docker'
+        scannerMode: CLI
     - task: Docker@2
       displayName: Build and push an image to container registry
       inputs:
@@ -38,6 +79,110 @@ stages:
         containerRegistry: $(dockerRegistryServiceConnection)
         tags: |
           $(tag)
-          
-    - upload: manifests
-      artifact: manifests
+    - task: Bash@3
+      displayName: Run Trivy Scan to scan docker images (2)
+      inputs:
+        targetType: 'inline'
+        script: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy --exit-code 0 --severity MEDIUM,HIGH --ignore-unfixed $(containerRegistry)/$(imageName):$(tag)
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy --exit-code 1 --severity CRITICAL --ignore-unfixed $(containerRegistry)/$(imageName):$(tag)
+    - task: SonarCloudAnalyze@1
+      displayName: 'Run Code Analysis'
+    - task: SonarCloudPublish@1
+      displayName: 'Publish Quality Gate Result'
+    - task: CmdLine@2
+      displayName: tag the new build with latest tag
+      inputs:
+        script: 'docker tag $(imageRepository):$(tag) $(imageRepository):latest'
+    - task: Docker@2
+      displayName: push the latest tag
+      inputs:
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)
+        command: 'push'
+        tags: 'latest'
+    - task: Bash@3
+      displayName: debug - check file contents on build agent
+      inputs:
+        targetType: 'inline'
+        script: 'pwd; echo $BUILD_SOURCESDIRECTORY; echo $BUILD_ARTIFACTSTAGINGDIRECTORY; ls -al $BUILD_SOURCEDIRECTORY'
+    - task: CopyFiles@2
+      inputs:
+        contents: $(build.sourcesDirectory)/deployment/*.yml
+        targetFolder: $(build.artifactStagingDirectory)
+    - task: Bash@3
+      displayName: check copy destination folders
+      inputs:
+       targetType: 'inline'
+       script: 'ls -al $BUILD_ARTIFACTSTAGINGDIRECTORY; cat $BUILD_ARTIFACTSTAGINGDIRECTORY/deployment/deployment.yml'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathtoPublish: $(build.artifactStagingDirectory)
+        artifactName: deploy_artifacts
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  jobs:  
+  - job: Download_artifacts
+    displayName: download and process artifacts
+    pool: k8s-hosted-agent    # using the self-hosted agent on k8s which is my laptop
+    steps:
+    - task: CmdLine@2
+      displayName: show workspace and other environment variables
+      inputs:
+        script: 'env | sort'
+    - task: CmdLine@2
+      displayName: list files
+      inputs:
+        script: 'echo $PWD ; ls -al ; echo BUILD_ARTIFACTSTAGINGDIRECTORY ; echo $BUILD_ARTIFACTSTAGINGDIRECTORY ; ls -al $BUILD_ARTIFACTSTAGINGDIRECTORY'
+    - task: DownloadPipelineArtifact@2
+      inputs:
+          source: 'current'
+          #project: # Required when source == Specific
+          #pipeline: # Required when source == Specific
+          preferTriggeringPipeline: false # Optional
+          #runVersion: 'latest' # Required when source == Specific# Options: latest, latestFromBranch, specific
+          #runBranch: 'refs/heads/master' # Required when source == Specific && RunVersion == LatestFromBranch
+          #runId: # Required when source == Specific && RunVersion == Specific
+          #tags: # Optional
+          artifact: deploy_artifacts
+          #patterns: '**' # Optional
+          path: '$(Pipeline.Workspace)'
+  - deployment: Deploy_2_k8s_osscluster
+    variables:
+    - name: kub-pod-instancecount
+      value: 1
+    - name: appName
+      value: pipeline-nodejs-app
+    - name: svcName
+      value: pipeline-nodejs-svc
+    - name: containerRegistry
+      value: 'docker.io/ezlee'
+    pool: k8s-hosted-agent
+    environment: 'osscluster'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: replacetokens@3
+            displayName: Apply variables to the deployment yaml file
+            inputs:
+              rootDirectory: $(Pipeline.Workspace)/deploy_artifacts
+              targetFiles: '**\deployment.yml'
+              keepToken: true
+              tokenPrefix: __
+              tokenSuffix: __
+          - task: Kubernetes@1
+            displayName: kubectl apply
+            inputs:
+              connectionType: Kubernetes Service Connection
+              kubernetesServiceEndpoint: 'osscluster-default-cluster-admin'
+              containerRegistryType: Container Registry
+              dockerRegistryEndpoint: $(containerRegistry) 
+              secretType: dockerRegistry
+              secretName: 
+              kubernetesCluster: osscluster
+              namespace: default
+              command: apply
+              arguments: -f $(Pipeline.Workspace)/deploy_artifacts/deployment/deployment.yml

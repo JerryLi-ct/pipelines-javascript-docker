@@ -1,19 +1,31 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: deployment
+  name: pipeline-deploy-__tag__
 spec:
   selector:
     matchLabels:
-      app: pipeline-javascript-docker
-  replicas: 1
+      app: __appName__-__tag__
+  replicas: __kub-pod-instancecount__
   template:
     metadata:
       labels:
-        app: pipeline-nodejs-app
+        app: __appName__-__tag__
     spec:
       containers:
-      - name: pipeline-javascript-docker
-        image: pipeline-javascript-docker
+      - name: pipelines-javascript-k8s-__tag__
+        image: ezlee/__imageName__:__tag__
         ports:
         - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __svcName__-__tag__
+spec:
+  selector:
+    app: __appName__-__tag__
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: LoadBalancer
