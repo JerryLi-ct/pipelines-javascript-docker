@@ -13,6 +13,7 @@ trigger:
     - deployment/*
     - azure-pipelines.yml
     - README.md
+    - sonar-project.properties
 
 resources:
 - repo: self
